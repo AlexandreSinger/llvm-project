@@ -196,6 +196,10 @@ def AffineLoopTiling : Pass<"affine-loop-tile", "func::FuncOp"> {
     ListOption<"tileSizes", "tile-sizes", "unsigned",
                "List of tile sizes for each perfect nest "
                "(overridden by -tile-size)">,
+    Option<"fpChunkDivisor", "fp-chunk-divisor", "uint64_t", /*default*/"0",
+           "Specify if the footprint must be a multiple of the given chunk "
+           "divisor (in bytes). This is useful for generating DMAs with constrained copy "
+           "widths">,
   ];
 }
 

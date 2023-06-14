@@ -15,6 +15,7 @@
 #ifndef MLIR_DIALECT_AFFINE_LOOPUTILS_H
 #define MLIR_DIALECT_AFFINE_LOOPUTILS_H
 
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Block.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
@@ -22,7 +23,6 @@
 #include <optional>
 
 namespace mlir {
-class AffineMap;
 class LoopLikeOpInterface;
 class OpBuilder;
 class Value;
@@ -346,6 +346,56 @@ LogicalResult coalescePerfectlyNestedLoops(LoopOpTy op) {
   }
   return result;
 }
+
+/// Class that encapsulates an Affine tiling analysis to find ideal tile sizes
+/// for DMA copies with a fixed-width chunking constraint.
+/// This pass assumes:
+///  - The loop band is perfect.
+///  - The loop bounds are static.
+///  - The Affine array acceses are parallel.
+///  - The DMA copies are continuous.
+/// Refer to Tiling for DMA-Based Hardware Accelerators for more information.
+///    doi: https://doi.org/10.1145/3589610.3596283
+class FixedWidthAffineTilingAnalysis {
+private:
+  // Variables provided by the user.
+  ArrayRef<AffineForOp> band;
+  uint64_t chunkSizeBytes;
+  uint64_t cacheSizeBytes;
+  // Map of the bound constraints on a memref within the loop band.
+  llvm::SmallDenseMap<Value, std::pair<AffineMap, AffineMap>, 4>
+      boundConstraints;
+  // Variables used for the exhaustive search.
+  SmallVector<unsigned> bestTileSizes;
+  uint64_t bestFootprint;
+  bool foundLegalTileSizes;
+  /// Populates the bounding constraints on the memrefs within a band based on
+  /// the Affine accesses on the memrefs.
+  LogicalResult getBoundingConstraints();
+  /// Get the footprint of all the copies that would be generated from the given
+  /// tile sizes using the bound constraints previously calculated.
+  uint64_t getFootprintOfCopies(SmallVectorImpl<unsigned> *tileSizes);
+  /// A recursive search that tests different tile sizes and populates the
+  /// bestTileSizes array with the best tile sizes. The function will set
+  /// foundLegalTileSizes to true if a legal tile size is found.
+  /// NOTE: A recursive alogorithm was used since the rank of the loop band is
+  ///       unknown.
+  /// NOTE: The time complexity of this search is logarithmic with the number of
+  ///       loops in the band and the size of the largest trip count.
+  void exhaustiveSearchForTileSizes(SmallVectorImpl<unsigned> *tileSizes,
+                                    unsigned id);
+
+public:
+  /// Calculates the best tile sizes that maximally fills the cache while
+  /// maintaining expected DMA copy widths to be multiples of a given fixed-
+  /// width chunk size.
+  /// Assumes the memory are copied in a single, continuous DMA copy.
+  LogicalResult getTileSizes(SmallVectorImpl<unsigned> *tileSizes);
+
+  explicit FixedWidthAffineTilingAnalysis(ArrayRef<AffineForOp> band,
+                                          uint64_t chunkSizeBytes,
+                                          uint64_t cacheSizeBytes);
+};
 
 } // namespace affine
 } // namespace mlir

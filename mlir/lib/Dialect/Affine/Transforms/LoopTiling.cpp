@@ -212,6 +212,17 @@ void LoopTiling::getTileSizes(ArrayRef<AffineForOp> band,
     return;
   }
 
+  // If a footprint chunk divisor is provided, run the fixed-width tiling
+  // analysis to choose the tile sizes.
+  if (fpChunkDivisor != 0) {
+    FixedWidthAffineTilingAnalysis fwata(band, fpChunkDivisor, cacheSizeBytes);
+    if (!failed(fwata.getTileSizes(tileSizes)))
+      return;
+    LLVM_DEBUG(llvm::dbgs()
+               << "Failed to find legal tile sizes that do not overflow the "
+                  "cache. Falling back on original implementation.\n");
+  }
+
   // Divide all loops equally in an attempt to reduce footprint.
   // TODO: this is approximate. Ideally, obtain reuse factor /
   // profitability along each dimension and weight tile sizes based on that as

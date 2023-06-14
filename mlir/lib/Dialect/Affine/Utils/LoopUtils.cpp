@@ -2770,3 +2770,326 @@ mlir::affine::separateFullTiles(MutableArrayRef<AffineForOp> inputNest,
 
   return success();
 }
+
+/// Linearize the memory locations of the memory access relations produced by
+/// the MemRefAccess class. This is so this analysis can handle multi-D array
+/// accesses.
+static LogicalResult linearizeAffineAccessRelation(FlatAffineRelation &relation,
+                                                   MemRefAccess &access) {
+  // Add a new dim to represent the linearized memory location.
+  relation.appendDomainVar();
+  // Set the new dim's constraint as a function of the non-linearized memory
+  // locations.
+  unsigned rank = access.getRank();
+  if (rank == 1)
+    return LogicalResult::success();
+  MemRefType memrefTy = access.memref.getType().cast<MemRefType>();
+  assert(memrefTy.hasStaticShape() &&
+         "Cannot delinearize dynamic shape memref while still being affine.");
+  assert(memrefTy.getLayout().isIdentity() &&
+         "TODO: Use the layout to delinearize instead of assuming row-major.");
+  SmallVector<int64_t, 4> linearizedConstraint(relation.getNumCols(), 0);
+  auto shape = memrefTy.getShape();
+  unsigned memLocBase = relation.getNumCols() - rank - 1;
+  for (unsigned i = 0; i < rank; i++) {
+    int64_t mul = 1;
+    for (unsigned j = i + 1; j < rank; j++)
+      mul *= shape[j];
+    linearizedConstraint[memLocBase + i] = mul;
+  }
+  linearizedConstraint[memLocBase - 1] = -1;
+  relation.addEquality(linearizedConstraint);
+  // Project out the non-linearized memory locations.
+  relation.projectOut(memLocBase, rank);
+  return LogicalResult::success();
+}
+
+/// Attempts to find a single constant upper or lower bound within a flat
+/// affine relation.
+static int64_t findConstBoundIneq(FlatAffineRelation &relation,
+                                  unsigned loopIVPos, int64_t constBound,
+                                  bool isUB) {
+  int64_t ineqRow = -1;
+  unsigned constPos = relation.getNumCols() - 1;
+  for (unsigned r = 0; r < relation.getNumInequalities(); r++) {
+    int64_t sign = isUB ? 1 : -1;
+    if (relation.atIneq(r, loopIVPos) * sign >= 0)
+      continue;
+    if (relation.atIneq(r, constPos) * sign != constBound)
+      continue;
+    bool allElseZero = true;
+    for (unsigned c = 0; c < relation.getNumCols() - 1; c++) {
+      if (c == loopIVPos)
+        continue;
+      if (relation.atIneq(r, c) != 0) {
+        allElseZero = false;
+        break;
+      }
+    }
+    if (!allElseZero)
+      continue;
+    assert(ineqRow == -1 &&
+           "TODO: handle multiple bound constraints for a single loop.");
+    ineqRow = r;
+  }
+  assert(ineqRow != -1 && "findConstBoundIneq: could not find constant bound.");
+  return ineqRow;
+}
+
+/// Sets the lower bound constraint from a given AffineForOp to 0.
+static LogicalResult setLowerBoundOfLoopToZero(AffineForOp forOp,
+                                               FlatAffineRelation &relation) {
+  assert(forOp.hasConstantLowerBound() &&
+         "setLowerBoundofLoopToZero: forOp expected to have constant lower "
+         "bound.");
+  // If the lower bound is already zero, no need to do anything.
+  int64_t constLB = forOp.getConstantLowerBound();
+  if (constLB == 0)
+    return LogicalResult::success();
+  // Find the position in the relation of the loops induction variable.
+  unsigned loopIVPos;
+  if (!relation.findVar(forOp.getInductionVar(), &loopIVPos))
+    return forOp->emitError(
+        "setLowerBoundOfLoopToZero: cannot find loop in relation\n");
+  // Find the constant upper bound constraint of the loop iv.
+  int64_t lbIneqRow =
+      findConstBoundIneq(relation, loopIVPos, constLB, /*isUB*/ false);
+  // Replace the lower bound of the induction variable with 0.
+  //    IV >= 0
+  SmallVector<int64_t, 4> lbConstraint(relation.getNumCols(), 0);
+  lbConstraint[loopIVPos] = 1;
+  relation.removeInequality(lbIneqRow);
+  relation.addInequality(lbConstraint);
+  return LogicalResult::success();
+}
+
+/// Set the upper bound constraint from a given AffineForOp to a symbolic
+/// variable to act as the tile size.
+static LogicalResult setUpperBoundOfLoopToSymbol(AffineForOp forOp,
+                                                 FlatAffineRelation &relation) {
+  assert(forOp.hasConstantUpperBound() &&
+         "setUpperBoundOfLoopToSymbol: forOp expected to have constant UB.");
+  // Create a symbolic variable to represent the tile size.
+  unsigned symPos = relation.appendSymbolVar();
+  // Find the position in the relation of the loops induction variable.
+  unsigned loopIVPos;
+  if (!relation.findVar(forOp.getInductionVar(), &loopIVPos))
+    return forOp->emitError(
+        "setUpperBoundOfLoopToSymbol: cannot find loop in relation\n");
+  // Find the constant upper bound constraint of the loop iv.
+  int64_t constUB = forOp.getConstantUpperBound() - 1;
+  int64_t ubIneqRow =
+      findConstBoundIneq(relation, loopIVPos, constUB, /*isUB*/ true);
+  // Replace the upperbound of the induction variable with the tile size.
+  //    iv < s ==> iv <= s - 1 ==> s - iv - 1 >= 0
+  SmallVector<int64_t, 4> ubConstraint(relation.getNumCols(), 0);
+  unsigned constPos = relation.getNumCols() - 1;
+  ubConstraint[symPos] = 1;
+  ubConstraint[loopIVPos] = -1;
+  ubConstraint[constPos] = -1;
+  relation.removeInequality(ubIneqRow);
+  relation.addInequality(ubConstraint);
+  // Set the upperbound of the tile size to the trip count.
+  //    s <= TC ==> TC - s >= 0
+  std::optional<uint64_t> tripCount = getConstantTripCount(forOp);
+  assert(tripCount.has_value() && "Trip count expected to be constant.");
+  SmallVector<int64_t, 4> tileUBConstraint(relation.getNumCols(), 0);
+  tileUBConstraint[constPos] = tripCount.value();
+  tileUBConstraint[symPos] = -1;
+  relation.addInequality(tileUBConstraint);
+  return LogicalResult::success();
+}
+
+LogicalResult
+mlir::affine::FixedWidthAffineTilingAnalysis::getBoundingConstraints() {
+  assert(boundConstraints.empty());
+  // Collect all of the relations of the memref that is being accessed
+  llvm::SmallDenseMap<Value, FlatAffineRelation, 4> relations;
+  auto result = band.front()->walk([&](Operation *opInst) -> WalkResult {
+    // If not a load or store op, skip
+    if (!isa<AffineReadOpInterface, AffineWriteOpInterface>(opInst))
+      return WalkResult::advance();
+    // Obtain the access relation from the MemRef acess.
+    MemRefAccess access(opInst);
+    FlatAffineRelation accessRel;
+    if (failed(access.getAccessRelation(accessRel)))
+      return opInst->emitError("Error obtaining access relation\n");
+    LLVM_DEBUG(llvm::dbgs() << "Access relation:\n");
+    LLVM_DEBUG(accessRel.print(llvm::dbgs()));
+    // Linearize the memory accesses on the dimensions. This analysis expects
+    // the input to be 1D.
+    if (failed(linearizeAffineAccessRelation(accessRel, access)))
+      return opInst->emitError("Failed to linearize access relation\n");
+    LLVM_DEBUG(llvm::dbgs() << "Linearized access relation:\n");
+    LLVM_DEBUG(accessRel.print(llvm::dbgs()));
+    // Simplify the polyhedron by setting the lower bound of the loop
+    // induction variables to 0, and the upperbound to a symbol.
+    for (AffineForOp loop : band) {
+      if (failed(setLowerBoundOfLoopToZero(loop, accessRel)))
+        return LogicalResult::failure();
+      if (failed(setUpperBoundOfLoopToSymbol(loop, accessRel)))
+        return LogicalResult::failure();
+    }
+    LLVM_DEBUG(llvm::dbgs() << "Simplified access relation:\n");
+    LLVM_DEBUG(accessRel.print(llvm::dbgs()));
+    // Project out the dimensional variables corresponding to the loop
+    // induction variables.
+    accessRel.projectOut(0, accessRel.getNumDimVars() - 1);
+    LLVM_DEBUG(llvm::dbgs() << "Projected access relation:\n");
+    LLVM_DEBUG(accessRel.print(llvm::dbgs()));
+    // Insert into the map of access relations. At the moment these are
+    // just being appended to the accesses. Ideally this should use some
+    // form of unionBoundingBox, however have found it to be unusable for
+    // this case.
+    auto it = relations.find(access.memref);
+    if (it == relations.end())
+      relations[access.memref] = std::move(accessRel);
+    else
+      relations[access.memref].append(accessRel);
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return LogicalResult::failure();
+  // TODO: The relation should be cleaned from clear duplicates to improve
+  //       performance. Cannot use removeTrivialRedundancies. It removes too
+  //       much. This would not be needed if unionBoundingBox would work.
+  LLVM_DEBUG({
+    for (auto relation : relations) {
+      llvm::dbgs() << "Full Relation for memeref " << relation.first << "\n";
+      relation.second.print(llvm::dbgs());
+    }
+  });
+  // Collect the lower and upper bounds of the access relations.
+  // These are what this analysis calls the "bound constraints".
+  for (auto relation : relations) {
+    assert(relation.second.getNumSymbolVars() == band.size());
+    assert(relation.second.getNumDimVars() == 1);
+    boundConstraints[relation.first] = relation.second.getLowerAndUpperBound(
+        0, 0, 1, 1, {}, band.front()->getContext());
+  }
+  LLVM_DEBUG({
+    for (auto mapPair : boundConstraints) {
+      llvm::dbgs()
+          << "Found the following bounds on the following memref's accesses: "
+          << mapPair.first << "\n";
+      llvm::dbgs() << "\tLower bound map: " << mapPair.second.first << "\n";
+      llvm::dbgs() << "\tUpper bound map: " << mapPair.second.second << "\n";
+    }
+  });
+  return LogicalResult::success();
+}
+
+/// Get the width of the data copy that would be generated from the given tile
+/// sizes based on the precalculated bounds.
+static int64_t getCopyWidth(SmallVectorImpl<unsigned> *tileSizes,
+                            std::pair<AffineMap, AffineMap> &bounds) {
+  // AffineMaps have a method to fold constant values. Those vales must be
+  // Attributes. Convert the tile sizes to IntegerAttributes.
+  SmallVector<Attribute> tileSizeAttrs(tileSizes->size());
+  Type intTy = IntegerType::get(bounds.first.getContext(), 64);
+  for (size_t i = 0; i < tileSizes->size(); i++)
+    tileSizeAttrs[i] = IntegerAttr::get(intTy, (*tileSizes)[i]);
+  // Fold the upper and lower bounds.
+  SmallVector<Attribute> upperBounds;
+  SmallVector<Attribute> lowerBounds;
+  LogicalResult res = bounds.second.constantFold(tileSizeAttrs, upperBounds);
+  assert(res.succeeded());
+  res = bounds.first.constantFold(tileSizeAttrs, lowerBounds);
+  assert(res.succeeded());
+  assert(!upperBounds.empty() && !lowerBounds.empty());
+  // Find the max upper bound and the min lower bound.
+  int64_t maxUB = upperBounds[0].cast<IntegerAttr>().getInt();
+  int64_t minLB = lowerBounds[0].cast<IntegerAttr>().getInt();
+  for (size_t i = 0; i < upperBounds.size(); i++)
+    maxUB = std::max(maxUB, upperBounds[i].cast<IntegerAttr>().getInt());
+  for (size_t i = 0; i < lowerBounds.size(); i++)
+    minLB = std::min(maxUB, lowerBounds[i].cast<IntegerAttr>().getInt());
+  // Return the distance between the max UB and min LB.
+  return maxUB - minLB;
+}
+
+uint64_t mlir::affine::FixedWidthAffineTilingAnalysis::getFootprintOfCopies(
+    SmallVectorImpl<unsigned> *tileSizes) {
+  assert(!boundConstraints.empty());
+  // Accumulate the footprint from each unique MemRef in the loop.
+  uint64_t footprint = 0;
+  for (auto mapPair : boundConstraints) {
+    int64_t copyWidth = getCopyWidth(tileSizes, mapPair.second);
+    assert(copyWidth > 0);
+    // Check that the copy width is a multiple of the chunk size.
+    auto memrefTy = mapPair.first.getType().cast<MemRefType>();
+    uint64_t copyWidthBytes =
+        copyWidth * (memrefTy.getElementTypeBitWidth() / 8);
+    if (copyWidthBytes % chunkSizeBytes != 0)
+      return 0;
+    // Add its width to the total footprint.
+    footprint += copyWidthBytes;
+  }
+  return footprint;
+}
+
+void mlir::affine::FixedWidthAffineTilingAnalysis::exhaustiveSearchForTileSizes(
+    SmallVectorImpl<unsigned> *tileSizes, unsigned id) {
+  // Base condition
+  if (id == band.size()) {
+    uint64_t footprint = getFootprintOfCopies(tileSizes);
+    // If footprint is 0, this signifies that the tile size was not legal.
+    if (footprint != 0) {
+      LLVM_DEBUG({
+        llvm::dbgs() << "Found legal tile size: ";
+        for (size_t i = 0; i < tileSizes->size(); i++) {
+          llvm::dbgs() << (*tileSizes)[i] << " ";
+        }
+        llvm::dbgs() << "\n";
+        llvm::dbgs() << "\tFootprint: " << footprint << "\n";
+      });
+      // If the footprint fits in the cache and is better than the last
+      // best footprint, this is the best tile sizes found so far.
+      if (footprint <= cacheSizeBytes && footprint > bestFootprint) {
+        LLVM_DEBUG(llvm::dbgs() << "\t*New best footprint*\n");
+        bestFootprint = footprint;
+        std::copy(tileSizes->begin(), tileSizes->end(), bestTileSizes.begin());
+        foundLegalTileSizes = true;
+      }
+    }
+    return;
+  }
+
+  // Iterate over the possible tile sizes. To avoid max and min bounds, only
+  // tile sizes that cleanly divide the trip count of the loop are considered.
+  std::optional<uint64_t> tripCount = getConstantTripCount(band[id]);
+  assert(tripCount.has_value() && "Trip count expected to be constant.");
+  for (size_t i = 1; i <= tripCount.value(); i++) {
+    if (tripCount.value() % i != 0)
+      continue;
+    (*tileSizes)[id] = i;
+    exhaustiveSearchForTileSizes(tileSizes, id + 1);
+  }
+}
+
+LogicalResult mlir::affine::FixedWidthAffineTilingAnalysis::getTileSizes(
+    SmallVectorImpl<unsigned> *tileSizes) {
+  // TODO: Before doing anything, check to ensure that all the assumptions
+  //       from the paper are met. Failing if they are not. meetsAssumptions()
+  // Populate the bounding constraints
+  if (failed(getBoundingConstraints()))
+    return LogicalResult::failure();
+  // Exhaustively search for the ideal tile sizes based on the constraints.
+  SmallVector<unsigned> tmpTileSizes(band.size(), 1);
+  exhaustiveSearchForTileSizes(&tmpTileSizes, 0);
+  if (!foundLegalTileSizes)
+    return LogicalResult::failure();
+  // Copy the best tile sizes found into the given tileSizes.
+  tileSizes->resize(bestTileSizes.size());
+  std::copy(bestTileSizes.begin(), bestTileSizes.end(), tileSizes->begin());
+  return LogicalResult::success();
+}
+
+mlir::affine::FixedWidthAffineTilingAnalysis::FixedWidthAffineTilingAnalysis(
+    ArrayRef<AffineForOp> band, uint64_t chunkSizeBytes,
+    uint64_t cacheSizeBytes)
+    : band(band), chunkSizeBytes(chunkSizeBytes),
+      cacheSizeBytes(cacheSizeBytes), bestFootprint(0),
+      foundLegalTileSizes(false) {
+  bestTileSizes.resize(band.size());
+}
